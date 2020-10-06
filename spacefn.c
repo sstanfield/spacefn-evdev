@@ -10,6 +10,8 @@
 #include <string.h>
 #include <fcntl.h>
 #include <stdlib.h>
+#include <sys/dir.h>
+#include <unistd.h>
 
 // Key mapping {{{1
 unsigned int key_map(unsigned int code) {
@@ -103,16 +105,12 @@ static void send_key(unsigned int code, int value) {
     libevdev_uinput_write_event(odev, EV_SYN, SYN_REPORT, 0);
 }
 
-static void send_press(unsigned int code) {
-    send_key(code, 1);
-}
-
-static void send_release(unsigned int code) {
-    send_key(code, 0);
-}
-
-static void send_repeat(unsigned int code) {
-    send_key(code, 2);
+// Useful for debugging.
+static void print_event(struct input_event *ev) {
+    printf("Event: %s %s %d\n",
+           libevdev_event_type_get_name(ev->type),
+           libevdev_event_code_get_name(ev->type, ev->code),
+           ev->value);
 }
 
 // input {{{2
@@ -155,6 +153,25 @@ static void state_idle(void) {  // {{{2
     }
 }
 
+// Change buffer from decide state raw keys to shift state mapped keys.
+// Just clearing the buffer on decide -> shift change can lead to presses without
+// a release sometimes and that can lock a laptop trackpad.
+void fix_buffer() {
+    unsigned int tbuffer[MAX_BUFFER];
+    int moves = 0;
+    for (int i=0; i<n_buffer; i++) {
+        unsigned int code = key_map(buffer[i]);
+        if (!code) {
+            code = buffer[i];
+        } else {
+            tbuffer[moves++] = code;
+        }
+        send_key(code, V_PRESS);
+    }
+    n_buffer = moves;
+    if (n_buffer > 0) memcpy(buffer, tbuffer, n_buffer * sizeof(*buffer));
+}
+
 static void state_decide(void) {    // {{{2
     n_buffer = 0;
     struct input_event ev;
@@ -180,8 +197,10 @@ static void state_decide(void) {    // {{{2
         if (ev.code == KEY_SPACE && ev.value == V_RELEASE) {
             send_key(KEY_SPACE, V_PRESS);
             send_key(KEY_SPACE, V_RELEASE);
+            // These weren't mapped, so send the actual presses and clear the buffer.
             for (int i=0; i<n_buffer; i++)
                 send_key(buffer[i], V_PRESS);
+            n_buffer = 0;
             state = IDLE;
             return;
         }
@@ -193,25 +212,25 @@ static void state_decide(void) {    // {{{2
 
         if (ev.value == V_RELEASE && buffer_remove(ev.code)) {
             unsigned int code = key_map(ev.code);
-            send_key(code, V_PRESS);
-            send_key(code, V_RELEASE);
+            if (code) {
+                send_key(code, V_PRESS);
+                send_key(code, V_RELEASE);
+            } else {
+                send_key(ev.code, V_PRESS);
+                send_key(ev.code, V_RELEASE);
+            }
             state = SHIFT;
+            fix_buffer();
             return;
         }
     }
 
     printf("timed out\n");
-    for (int i=0; i<n_buffer; i++) {
-        unsigned int code = key_map(buffer[i]);
-        if (!code)
-            code = buffer[i];
-        send_key(code, V_PRESS);
-    }
+    fix_buffer();
     state = SHIFT;
 }
 
 static void state_shift(void) {
-    n_buffer = 0;
     struct input_event ev;
     for (;;) {
         while (read_one_key(&ev));
@@ -257,13 +276,73 @@ static void run_state_machine(void) {
     }
 }
 
+int dev_select(const struct direct *entry) {
+    if (entry->d_type == DT_CHR) return 1;
+    else return 0;
+}
+
+int is_keeb(struct libevdev *idev) {
+    if (libevdev_has_event_type(idev, EV_KEY) &&
+        libevdev_has_event_type(idev, EV_SYN) &&
+        libevdev_get_phys(idev) &&  // This will exclude virtual keyboards (like another spacefn instance).
+        libevdev_has_event_code(idev, EV_KEY, KEY_SPACE) &&
+        libevdev_has_event_code(idev, EV_KEY, KEY_A)) return 1;
+    else return 0;
+}
 
 int main(int argc, char **argv) {   // {{{1
+    int count,i;
+    struct direct **files;
+
     if (argc < 2) {
-        printf("usage: %s /dev/input/...", argv[0]);
+        printf("usage: %s [--scan | /dev/input/...]\n", argv[0]);
+        printf("    --scan: attempt to identify any keyboards in /dev/input and exit\n");
         return 1;
     }
+    if (!strcmp(argv[1], "--scan")) {
+        count = scandir("/dev/input", &files, dev_select, alphasort);
+        for (i=0;i<count;i++) {
+            char namebuf[100];
+            namebuf[0] = 0;
+            strncat(namebuf, "/dev/input/", 99);
+            fd = open(strncat(namebuf, files[i]->d_name, 99), O_RDONLY);
+            namebuf[11] = 0;
+            if (fd < 0) {
+                perror("open input");
+                continue;
+            }
 
+            int err = libevdev_new_from_fd(fd, &idev);
+            if (err) {
+                continue;
+            }
+            if (is_keeb(idev)) {
+                printf("\nFound keyboard %s\n", strncat(namebuf, files[i]->d_name, 99));
+                namebuf[11] = 0;
+                printf("Input device name: \"%s\"\n", libevdev_get_name(idev));
+                printf("Input device ID: bus %#x vendor %#x product %#x\n",
+                   libevdev_get_id_bustype(idev),
+                   libevdev_get_id_vendor(idev),
+                   libevdev_get_id_product(idev));
+                printf("Location: %s\n", libevdev_get_phys(idev));
+                if (libevdev_get_uniq(idev)) printf("Identity: %s\n", libevdev_get_uniq(idev));
+            }
+            libevdev_free(idev);
+            close(fd);
+            free(files[i]);
+        }
+        free(files);
+        return 0;
+    }
+
+    // This sleep is a hack but it gives X time to read the Enter release event
+    // when starting (unless someone holds it longer then a second) which keeps
+    // several bad things from happening including "stuck" enter and possible locking
+    // of a laptop trackpad until another key is pressed- and maybe longer).
+    // Not sure who to solve this properly, the enter release will come from
+    // spacefn without it and X seems to not connect the press and release in 
+    // this case (different logical keyboards).
+    sleep(1);
     fd = open(argv[1], O_RDONLY);
     if (fd < 0) {
         perror("open input");
@@ -275,6 +354,17 @@ int main(int argc, char **argv) {   // {{{1
         fprintf(stderr, "Failed: (%d) %s\n", -err, strerror(err));
         return 1;
     }
+    printf("Input device name: \"%s\"\n", libevdev_get_name(idev));
+    printf("Input device ID: bus %#x vendor %#x product %#x\n",
+       libevdev_get_id_bustype(idev),
+       libevdev_get_id_vendor(idev),
+       libevdev_get_id_product(idev));
+    if (!is_keeb(idev)) {
+        fprintf(stderr, "This device does not look like a keyboard\n");
+        return 1;
+    }
+    printf("Location: %s\n", libevdev_get_phys(idev));
+    if (libevdev_get_uniq(idev)) printf("Identity: %s\n", libevdev_get_uniq(idev));
 
     int uifd = open("/dev/uinput", O_RDWR);
     if (uifd < 0) {
@@ -296,3 +386,4 @@ int main(int argc, char **argv) {   // {{{1
 
     run_state_machine();
 }
+
