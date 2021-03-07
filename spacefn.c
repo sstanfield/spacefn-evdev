@@ -17,7 +17,11 @@
  
 #include <unistd.h>
 
-// Key mapping {{{1
+#define KEY_MASK   0x000000FF
+#define FLAG_MASK  0x00000F00
+#define SHIFT_FLAG 0x00000100
+
+// Key mapping
 unsigned int key_map(unsigned int code) {
     switch (code) {
         case KEY_1:    // my magical escape button
@@ -61,6 +65,10 @@ unsigned int key_map(unsigned int code) {
             return KEY_8;
         case KEY_R:
             return KEY_9;
+        case KEY_L:
+            return SHIFT_FLAG | KEY_9;
+        case KEY_SEMICOLON:
+            return SHIFT_FLAG | KEY_0;
 
         case KEY_B:
             return KEY_PAGEDOWN;
@@ -75,40 +83,15 @@ unsigned int key_map(unsigned int code) {
     return 0;
 }
 
-// Blacklist keys for which I have a mapping, to try and train myself out of using them
-int blacklist(unsigned int code) {
-    /*switch (code) {
-        case KEY_UP:
-        case KEY_DOWN:
-        case KEY_RIGHT:
-        case KEY_LEFT:
-        case KEY_HOME:
-        case KEY_END:
-        case KEY_PAGEUP:
-        case KEY_PAGEDOWN:
-            return 1;
-    }*/
-    return 0;
-}
-
-
-// Global device handles {{{1
+// Global device handles
 struct libevdev *idev;
 struct libevdev_uinput *odev;
 int fd;
 
-// Ordered unique key buffer {{{1
+// Ordered unique key buffer
 #define MAX_BUFFER 8
 unsigned int buffer[MAX_BUFFER];
 unsigned int n_buffer = 0;
-
-static int buffer_contains(unsigned int code) {
-    for (int i=0; i<n_buffer; i++)
-        if (buffer[i] == code)
-            return 1;
-
-    return 0;
-}
 
 static int buffer_remove(unsigned int code) {
     for (int i=0; i<n_buffer; i++)
@@ -127,13 +110,16 @@ static int buffer_append(unsigned int code) {
     return 0;
 }
 
-// Key I/O functions {{{1
-// output {{{2
+// Key I/O functions
 #define V_RELEASE 0
 #define V_PRESS 1
 #define V_REPEAT 2
 static void send_key(unsigned int code, int value) {
-    libevdev_uinput_write_event(odev, EV_KEY, code, value);
+    if (code & SHIFT_FLAG) {
+        libevdev_uinput_write_event(odev, EV_KEY, KEY_RIGHTSHIFT, value);
+    }
+
+    libevdev_uinput_write_event(odev, EV_KEY, code & KEY_MASK, value);
     libevdev_uinput_write_event(odev, EV_SYN, SYN_REPORT, 0);
 }
 
@@ -145,7 +131,6 @@ static void print_event(struct input_event *ev) {
            ev->value);
 }
 
-// input {{{2
 static int read_one_key(struct input_event *ev) {
     int err = libevdev_next_event(idev, LIBEVDEV_READ_FLAG_NORMAL | LIBEVDEV_READ_FLAG_BLOCKING, ev);
     if (err) {
@@ -158,20 +143,16 @@ static int read_one_key(struct input_event *ev) {
         return -1;
     }
 
-    if (blacklist(ev->code))
-        return -1;
-
     return 0;
 }
 
-// State functions {{{1
 enum {
     IDLE,
     DECIDE,
     SHIFT,
 } state = IDLE;
 
-static void state_idle(void) {  // {{{2
+static void state_idle(void) {
     struct input_event ev;
     for (;;) {
         while (read_one_key(&ev));
@@ -185,81 +166,37 @@ static void state_idle(void) {  // {{{2
     }
 }
 
-// Change buffer from decide state raw keys to shift state mapped keys.
-// Just clearing the buffer on decide -> shift change can lead to presses without
-// a release sometimes and that can lock a laptop trackpad.
-void fix_buffer() {
-    unsigned int tbuffer[MAX_BUFFER];
-    int moves = 0;
-    for (int i=0; i<n_buffer; i++) {
-        unsigned int code = key_map(buffer[i]);
-        if (!code) {
-            code = buffer[i];
-        } else {
-            tbuffer[moves++] = code;
-        }
-        send_key(code, V_PRESS);
-    }
-    n_buffer = moves;
-    if (n_buffer > 0) memcpy(buffer, tbuffer, n_buffer * sizeof(*buffer));
-}
-
-static void state_decide(void) {    // {{{2
+static void state_decide(void) {
     n_buffer = 0;
     struct input_event ev;
-    struct timeval timeout;
-    timeout.tv_sec = 0;
-    timeout.tv_usec = 200000;
-    fd_set set;
-    FD_ZERO(&set);
 
-    while (timeout.tv_usec >= 0) {
-        FD_SET(fd, &set);
-        int nfds = select(fd+1, &set, NULL, NULL, &timeout);
-        if (!nfds)
-            break;
-
-        while (read_one_key(&ev));
+    for (;;) {
+	    while (read_one_key(&ev));
 
         if (ev.value == V_PRESS) {
-            buffer_append(ev.code);
-            continue;
+            unsigned int code = key_map(ev.code);
+            if (code) {
+                buffer_append(code);
+                send_key(code, ev.value);
+            } else {
+                send_key(ev.code, ev.value);
+            }
+            state = SHIFT;
+            return;
         }
 
         if (ev.code == KEY_SPACE && ev.value == V_RELEASE) {
             send_key(KEY_SPACE, V_PRESS);
             send_key(KEY_SPACE, V_RELEASE);
-            // These weren't mapped, so send the actual presses and clear the buffer.
-            for (int i=0; i<n_buffer; i++)
-                send_key(buffer[i], V_PRESS);
-            n_buffer = 0;
             state = IDLE;
             return;
         }
 
-        if (ev.value == V_RELEASE && !buffer_contains(ev.code)) {
+        if (ev.value == V_RELEASE) {
             send_key(ev.code, ev.value);
             continue;
         }
-
-        if (ev.value == V_RELEASE && buffer_remove(ev.code)) {
-            unsigned int code = key_map(ev.code);
-            if (code) {
-                send_key(code, V_PRESS);
-                send_key(code, V_RELEASE);
-            } else {
-                send_key(ev.code, V_PRESS);
-                send_key(ev.code, V_RELEASE);
-	        }
-            state = SHIFT;
-            fix_buffer();
-            return;
-        }
     }
-
-    printf("timed out\n");
-    fix_buffer();
-    state = SHIFT;
 }
 
 static void state_shift(void) {
@@ -293,7 +230,7 @@ static void state_shift(void) {
 
 static void run_state_machine(void) {
     for (;;) {
-        printf("state %d\n", state);
+        //printf("state %d\n", state);
         switch (state) {
             case IDLE:
                 state_idle();
@@ -324,7 +261,7 @@ int is_keeb(struct libevdev *idev) {
     else return 0;
 }
 
-int main(int argc, char **argv) {   // {{{1
+int main(int argc, char **argv) {
     int count,i;
     struct direct **files;
 
@@ -373,7 +310,7 @@ int main(int argc, char **argv) {   // {{{1
     // when starting (unless someone holds it longer then a second) which keeps
     // several bad things from happening including "stuck" enter and possible locking
     // of a laptop trackpad until another key is pressed- and maybe longer).
-    // Not sure who to solve this properly, the enter release will come from
+    // Not sure how to solve this properly, the enter release will come from
     // spacefn without it and X seems to not connect the press and release in 
     // this case (different logical keyboards).
     sleep(1);
