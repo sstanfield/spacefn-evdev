@@ -178,11 +178,14 @@ static void state_decide(void) {
             if (code) {
                 buffer_append(code);
                 send_key(code, ev.value);
+                state = SHIFT;
+                return;
             } else {
+                send_key(KEY_SPACE, V_PRESS);
                 send_key(ev.code, ev.value);
+                state = IDLE;
+                return;
             }
-            state = SHIFT;
-            return;
         }
 
         if (ev.code == KEY_SPACE && ev.value == V_RELEASE) {
