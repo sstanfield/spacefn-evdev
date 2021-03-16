@@ -24,8 +24,8 @@
 // Key mapping
 unsigned int key_map(unsigned int code) {
     switch (code) {
-        case KEY_1:    // my magical escape button
-            exit(0);
+        //case KEY_1:    // my magical escape button
+        //    exit(0);
 
         // HJKL for colemak
         case KEY_H:
@@ -94,19 +94,43 @@ unsigned int buffer[MAX_BUFFER];
 unsigned int n_buffer = 0;
 
 static int buffer_remove(unsigned int code) {
-    for (int i=0; i<n_buffer; i++)
+    for (int i=0; i<n_buffer; i++) {
         if (buffer[i] == code) {
             memcpy(&buffer[i], &buffer[i+1], (n_buffer - i - 1) * sizeof(*buffer));
             n_buffer--;
             return 1;
         }
+    }
     return 0;
 }
 
 static int buffer_append(unsigned int code) {
-    if (n_buffer >= MAX_BUFFER)
+    if (n_buffer >= MAX_BUFFER) {
         return 1;
+    }
     buffer[n_buffer++] = code;
+    return 0;
+}
+
+unsigned int need_release[MAX_BUFFER];
+unsigned int n_need_release = 0;
+
+static int need_release_remove(unsigned int code) {
+    for (int i=0; i<n_need_release; i++) {
+        if (need_release[i] == code) {
+            memcpy(&need_release[i], &need_release[i+1], (n_need_release - i - 1) * sizeof(*need_release));
+            n_need_release--;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int need_release_append(unsigned int code) {
+    if (n_need_release >= MAX_BUFFER) {
+        return 1;
+    }
+    need_release[n_need_release++] = code;
     return 0;
 }
 
@@ -162,12 +186,22 @@ static void state_idle(void) {
             return;
         }
 
+        if (ev.value == V_RELEASE) {
+            unsigned int code = key_map(ev.code);
+            if (code && need_release_remove(code)) {
+                if (buffer_remove(code)) {
+                    send_key(code, V_PRESS);
+	            }
+                send_key(code, ev.value);
+                continue;
+	        }
+        }
         send_key(ev.code, ev.value);
     }
 }
 
 static void state_decide(void) {
-    n_buffer = 0;
+    //n_buffer = 0;
     struct input_event ev;
 
     for (;;) {
@@ -177,7 +211,8 @@ static void state_decide(void) {
             unsigned int code = key_map(ev.code);
             if (code) {
                 buffer_append(code);
-                send_key(code, ev.value);
+                need_release_append(code);
+                //send_key(code, ev.value);
                 state = SHIFT;
                 return;
             } else {
@@ -196,7 +231,15 @@ static void state_decide(void) {
         }
 
         if (ev.value == V_RELEASE) {
-            send_key(ev.code, ev.value);
+            unsigned int code = key_map(ev.code);
+            if (code && need_release_remove(code)) {
+                if (buffer_remove(code)) {
+                    send_key(code, V_PRESS);
+	            }
+                send_key(code, ev.value);
+	        } else {
+                send_key(ev.code, ev.value);
+            }
             continue;
         }
     }
@@ -208,8 +251,8 @@ static void state_shift(void) {
         while (read_one_key(&ev));
 
         if (ev.code == KEY_SPACE && ev.value == V_RELEASE) {
-            for (int i=0; i<n_buffer; i++)
-                send_key(buffer[i], V_RELEASE);
+            //for (int i=0; i<n_buffer; i++)
+            //    send_key(buffer[i], V_RELEASE);
             state = IDLE;
             return;
         }
@@ -218,12 +261,23 @@ static void state_shift(void) {
 
         unsigned int code = key_map(ev.code);
         if (code) {
-            if (ev.value == V_PRESS)
+            if (ev.value == V_PRESS) {
                 buffer_append(code);
-            else if (ev.value == V_RELEASE)
-                buffer_remove(code);
+                need_release_append(code);
+            } else if (ev.value == V_RELEASE) {
+                if (buffer_remove(code)) {
+                    send_key(code, V_PRESS);
+	            }
+                need_release_remove(code);
+                send_key(code, ev.value);
+            } else {
+                if (buffer_remove(code)) {
+                    send_key(code, V_PRESS);
+	            }
+                send_key(code, ev.value);
+	        }
 
-            send_key(code, ev.value);
+            //send_key(code, ev.value);
         } else {
             send_key(ev.code, ev.value);
         }
