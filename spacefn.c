@@ -199,53 +199,66 @@ static void state_decide(void) {
         if (ev.value == V_PRESS) {
             unsigned int code = key_map(ev.code);
             if (code) {
+                for (int i=0; i<n_buffer; i++) {
+                    send_key(buffer[i], V_PRESS);
+                }
+                n_buffer = 0;
                 buffer_append(ev.code);
                 state = SHIFT;
                 return;
             } else {
-                send_key(ev.code, ev.value);
-                state = SHIFT;
-                return;
+                buffer_append(ev.code);
             }
         }
 
         if (ev.code == KEY_SPACE && ev.value == V_RELEASE) {
             send_key(KEY_SPACE, V_PRESS);
+            for (int i=0; i<n_buffer; i++) {
+                send_key(buffer[i], V_PRESS);
+            }
             send_key(KEY_SPACE, V_RELEASE);
             state = IDLE;
             return;
         }
 
-        // Indicates a key press before space so back to idle.
+        // Indicates a key press before space or during space (not mapped) so
+        // just send it.
         if (ev.value == V_RELEASE) {
-            send_key(KEY_SPACE, V_PRESS);
+            if (buffer_remove(ev.code)) {
+                send_key(ev.code, V_PRESS);
+            }
             send_key(ev.code, ev.value);
-            state = IDLE;
-            return;
         }
     }
 }
 
 static void state_shift(void) {
-	n_need_release = 0;
+    n_need_release = 0;
+    int sent_code = 0;
     struct input_event ev;
     for (;;) {
         while (read_one_key(&ev));
 
         if (ev.code == KEY_SPACE && ev.value == V_RELEASE) {
-            for (int i=0; i<n_buffer; i++) {
-                send_key(buffer[i], V_PRESS);
-            }
             for (int i=0; i<n_need_release; i++) {
                 send_key(key_map(need_release[i]), V_RELEASE);
                 send_key(need_release[i], V_PRESS);
+            }
+            if (!sent_code) {
+                // Did not actually map anything so send the space.
+                send_key(KEY_SPACE, V_PRESS);
+                // Also send any orphaned keys.
+                for (int i=0; i<n_buffer; i++) {
+                    send_key(buffer[i], V_PRESS);
+                }
+                send_key(KEY_SPACE, V_RELEASE);
             }
             state = IDLE;
             return;
         }
         if (ev.code == KEY_SPACE) {
-	        continue;
-	    }
+            continue;
+        }
 
         unsigned int code = key_map(ev.code);
         if (code) {
@@ -254,16 +267,18 @@ static void state_shift(void) {
             } else if (ev.value == V_RELEASE) {
                 if (buffer_remove(ev.code)) {
                     send_key(code, V_PRESS);
-	            }
+                }
                 send_key(code, ev.value);
                 need_release_remove(ev.code);
+                sent_code = 1;
             } else {
                 if (buffer_remove(ev.code)) {
                     send_key(code, V_PRESS);
                     need_release_append(ev.code);
-	            }
+                }
                 send_key(code, ev.value);
-	        }
+                sent_code = 1;
+            }
         } else {
             send_key(ev.code, ev.value);
         }
